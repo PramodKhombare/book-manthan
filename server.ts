@@ -52,8 +52,12 @@ if (geminiApiKey) {
 const parsePdf = async (buffer: Buffer): Promise<string> => {
   try {
     const parser = new PDFParse({ data: buffer });
-    const data: any = await parser.getText();
-    return (data && data.text) ? String(data.text) : '';
+    const result: any = await parser.getText();
+    if (!result) return '';
+    if (typeof result === 'string') return result;
+    if (typeof result.text === 'string') return result.text;
+    if (typeof result.textContent === 'string') return result.textContent;
+    return String(result);
   } catch (error: any) {
     console.error('Error parsing PDF:', error);
     throw new Error(`Failed to parse PDF document: ${error.message || error}`);
