@@ -1,7 +1,7 @@
 ﻿import express from 'express';
 import path from 'path';
 import multer from 'multer';
-import * as pdfParse from 'pdf-parse';
+import { PDFParse } from 'pdf-parse';
 import mammoth from 'mammoth';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
@@ -51,7 +51,8 @@ if (geminiApiKey) {
 // Helper to parse PDF documents cleanly
 const parsePdf = async (buffer: Buffer): Promise<string> => {
   try {
-    const data: any = await (pdfParse as any)(buffer);
+    const parser = new PDFParse({ data: buffer });
+    const data: any = await parser.getText();
     return (data && data.text) ? String(data.text) : '';
   } catch (error: any) {
     console.error('Error parsing PDF:', error);

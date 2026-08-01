@@ -30,7 +30,13 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
+import { createClient } from '@supabase/supabase-js';
 import { BookAnalysisResult, UserProfile } from './types';
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const supabase = SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+const canUseSupabase = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 // Constants for categories and colors
 const CATEGORY_COLORS: Record<string, { bg: string; text: string; border: string; accent: string }> = {
@@ -57,6 +63,8 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [loadingPhaseIndex, setLoadingPhaseIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
   
   // App state
   const [currentAnalysis, setCurrentAnalysis] = useState<BookAnalysisResult | null>(null);
@@ -69,11 +77,7 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // User Profile configuration
-  const [currentUser, setCurrentUser] = useState<UserProfile>({
-    email: 'scholar@gmail.com',
-    name: 'Scholar',
-    provider: 'email',
-  });
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
 
   // Fetch usage history from server-side cache memory
   const fetchUserHistory = async (user: UserProfile) => {
@@ -127,30 +131,127 @@ export default function App() {
     }
   };
 
+  const signInWithGoogle = async () => {
+    if (!supabase) {
+      setError('Google sign-in is not available because Supabase is not configured.');
+      return;
+    }
+
+    try {
+      setAuthLoading(true);
+      const { data, error } = await supabase.auth.signInWithOAuth({ provider: 'google' });
+      if (error) {
+        setError(error.message || 'Unable to start Google sign-in.');
+        setAuthLoading(false);
+        return;
+      }
+
+      if (data?.url) {
+        window.location.assign(data.url);
+      } else {
+        setError('Google sign-in could not redirect to the auth provider.');
+        setAuthLoading(false);
+      }
+    } catch (err: any) {
+      setError(err.message || 'An unexpected error occurred during Google sign-in.');
+      setAuthLoading(false);
+    }
+  };
+
+  const signOut = async () => {
+    try {
+      if (supabase) {
+        await supabase.auth.signOut();
+      }
+    } catch (err) {
+      console.error('Error signing out of Supabase:', err);
+    }
+    setCurrentUser(null);
+    localStorage.removeItem('book_analyzer_user');
+    setHistory([]);
+    setCurrentAnalysis(null);
+  };
+
   // Check login session on mount
   useEffect(() => {
-    try {
-      const savedUser = localStorage.getItem('book_analyzer_user');
-      let user: UserProfile;
-      if (savedUser) {
-        user = JSON.parse(savedUser) as UserProfile;
-        setCurrentUser(user);
-      } else {
-        user = {
-          email: 'scholar@gmail.com',
-          name: 'Scholar',
-          provider: 'email',
-        };
-        localStorage.setItem('book_analyzer_user', JSON.stringify(user));
+    const initializeAuth = async () => {
+      try {
+        const savedUser = localStorage.getItem('book_analyzer_user');
+        const userFromStorage = savedUser ? (JSON.parse(savedUser) as UserProfile) : null;
+
+        if (canUseSupabase && supabase) {
+          setAuthLoading(true);
+          const { data } = await supabase.auth.getSession();
+          const sessionUser = data?.session?.user;
+
+          if (sessionUser && sessionUser.email) {
+            const user: UserProfile = {
+              email: sessionUser.email,
+              name: (sessionUser.user_metadata as any)?.full_name || sessionUser.email.split('@')[0],
+              provider: 'google',
+              avatarUrl: (sessionUser.user_metadata as any)?.avatar_url || undefined,
+            };
+            setCurrentUser(user);
+            localStorage.setItem('book_analyzer_user', JSON.stringify(user));
+            await fetchUserHistory(user);
+            setAuthLoading(false);
+            setAuthChecked(true);
+            return;
+          }
+        }
+
+        if (userFromStorage) {
+          setCurrentUser(userFromStorage);
+          await fetchUserHistory(userFromStorage);
+        } else if (!canUseSupabase) {
+          const guestUser: UserProfile = {
+            email: 'scholar@gmail.com',
+            name: 'Scholar',
+            provider: 'email',
+          };
+          setCurrentUser(guestUser);
+          localStorage.setItem('book_analyzer_user', JSON.stringify(guestUser));
+          await fetchUserHistory(guestUser);
+        }
+      } catch (e) {
+        console.error('Failed to load user from localStorage or Supabase session', e);
+      } finally {
+        setAuthLoading(false);
+        setAuthChecked(true);
       }
-      fetchUserHistory(user);
-    } catch (e) {
-      console.error('Failed to load user from localStorage', e);
-    }
+    };
+
+    const authListener = supabase?.auth.onAuthStateChange(async (_event, session) => {
+      if (session?.user?.email) {
+        const user: UserProfile = {
+          email: session.user.email,
+          name: (session.user.user_metadata as any)?.full_name || session.user.email.split('@')[0],
+          provider: 'google',
+          avatarUrl: (session.user.user_metadata as any)?.avatar_url || undefined,
+        };
+        setCurrentUser(user);
+        localStorage.setItem('book_analyzer_user', JSON.stringify(user));
+        await fetchUserHistory(user);
+      }
+    });
+ 
+    initializeAuth();
+ 
+    return () => {
+      if (authListener?.data?.subscription?.unsubscribe) {
+        authListener.data.subscription.unsubscribe();
+      }
+    };
   }, []);
 
   // Reset session and clear analysis history from cache memory
   const handleResetSession = async () => {
+    if (!currentUser) {
+      setHistory([]);
+      setCurrentAnalysis(null);
+      return;
+    }
+
     try {
       const identifier = currentUser.email;
       await fetch('/api/user/history', {
@@ -502,7 +603,7 @@ ${top5Evaluation.rankingJustification}
           
           <div className="flex items-center space-x-4">
             <div className="flex items-center space-x-2.5 bg-slate-50 border border-slate-200 p-1.5 pr-3 rounded-full">
-              {currentUser.avatarUrl ? (
+              {currentUser?.avatarUrl ? (
                 <img 
                   src={currentUser.avatarUrl} 
                   alt={currentUser.name} 
@@ -511,12 +612,12 @@ ${top5Evaluation.rankingJustification}
                 />
               ) : (
                 <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-xs border border-indigo-200">
-                  {currentUser.name.charAt(0).toUpperCase()}
+                  {(currentUser?.name || 'Guest').charAt(0).toUpperCase()}
                 </div>
               )}
               <div className="text-left hidden sm:block">
-                <p className="text-xs font-bold text-slate-800 leading-none">{currentUser.name}</p>
-                <p className="text-[9px] text-slate-400 font-mono leading-none mt-1">{currentUser.email}</p>
+                <p className="text-xs font-bold text-slate-800 leading-none">{currentUser?.name || 'Guest'}</p>
+                <p className="text-[9px] text-slate-400 font-mono leading-none mt-1">{currentUser?.email || 'guest@example.com'}</p>
               </div>
             </div>
 
@@ -527,12 +628,72 @@ ${top5Evaluation.rankingJustification}
             >
               <Trash2 className="w-4 h-4" />
             </button>
+            {currentUser && (
+              <button
+                onClick={signOut}
+                className="p-2 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-lg transition-colors cursor-pointer"
+                title="Sign out"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
       </header>
 
+      {(!currentUser && authChecked && canUseSupabase) && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-3xl border border-white/10 bg-slate-900/95 p-8 text-white shadow-2xl">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <p className="text-xs uppercase tracking-[0.35em] text-emerald-300">Book Manthan</p>
+                <h1 className="mt-3 text-3xl font-bold">Welcome back</h1>
+                <p className="mt-2 text-sm text-slate-300">Sign in with Google to continue your personalized book analysis experience.</p>
+              </div>
+              <div className="w-14 h-14 rounded-3xl bg-white/10 flex items-center justify-center text-indigo-200">
+                <BookOpen className="w-7 h-7" />
+              </div>
+            </div>
+
+            <button
+              onClick={signInWithGoogle}
+              disabled={authLoading}
+              className="w-full inline-flex items-center justify-center gap-3 rounded-2xl bg-white text-slate-950 px-4 py-3 font-semibold shadow-xl shadow-slate-950/10 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              <img src="https://www.svgrepo.com/show/354169/google.svg" alt="Google" className="h-5 w-5" />
+              {authLoading ? 'Redirecting to Google…' : 'Continue with Google'}
+            </button>
+
+            <div className="mt-6 rounded-2xl border border-white/10 bg-slate-950/80 p-4 text-sm text-slate-300">
+              <p className="font-medium text-slate-100">Why sign in?</p>
+              <ul className="mt-3 space-y-2 list-disc pl-5 text-slate-400">
+                <li>Save your analysis history across devices.</li>
+                <li>Keep uploaded book sessions private and synced.</li>
+                <li>Load your past summaries instantly.</li>
+              </ul>
+            </div>
+
+            <button
+              onClick={() => {
+                const guestUser: UserProfile = {
+                  email: 'scholar@gmail.com',
+                  name: 'Scholar',
+                  provider: 'email',
+                };
+                localStorage.setItem('book_analyzer_user', JSON.stringify(guestUser));
+                setCurrentUser(guestUser);
+                fetchUserHistory(guestUser);
+              }}
+              className="mt-5 w-full rounded-2xl border border-white/10 bg-slate-800 px-4 py-3 text-sm text-slate-200 transition hover:bg-slate-700"
+            >
+              Continue as guest
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* MAIN CONTAINER */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col lg:flex-row gap-6">
+      <main className={`flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col lg:flex-row gap-6 ${!currentUser && authChecked && canUseSupabase ? 'pointer-events-none blur-sm' : ''}`}>
         
         {/* LEFT PANEL: UPLOAD AND DEMO PRESETS */}
         <section className="w-full lg:w-[350px] shrink-0 flex flex-col gap-6">
