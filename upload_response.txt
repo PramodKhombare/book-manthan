@@ -1,0 +1,10 @@
+HTTP/1.1 500 Internal Server Error
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 97
+ETag: W/"61-GXyiLw1Ar0aEKH7CkOZKg3LgF1c"
+Date: Sat, 01 Aug 2026 14:59:49 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+{"error":"Gemini API key is not configured on the server. Please add GEMINI_API_KEY in Secrets."}

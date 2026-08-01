@@ -1,7 +1,7 @@
-import express from 'express';
+﻿import express from 'express';
 import path from 'path';
 import multer from 'multer';
-import { PDFParse } from 'pdf-parse';
+import * as pdfParse from 'pdf-parse';
 import mammoth from 'mammoth';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
@@ -23,35 +23,39 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB limit
 });
 
-// Initialize Gemini Client
-const apiKey = process.env.GEMINI_API_KEY;
-const ai = new GoogleGenAI({
-  apiKey: apiKey,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+// Initialize AI clients
+const geminiApiKey = process.env.GEMINI_API_KEY;
+const openaiApiKey = process.env.OPENAI_API_KEY;
+const isOpenRouterKey = Boolean(openaiApiKey?.startsWith('sk-or-v1-'));
+const openaiBaseUrl = process.env.OPENAI_BASE_URL || (isOpenRouterKey
+  ? 'https://openrouter.ai/api/v1/chat/completions'
+  : 'https://api.openai.com/v1/chat/completions');
+const normalizeModelName = (model: string) => {
+  if (!model || model.includes('/')) {
+    return model;
+  }
+  return isOpenRouterKey ? `openai/${model}` : model;
+};
+let ai: any = undefined;
+if (geminiApiKey) {
+  ai = new GoogleGenAI({
+    apiKey: geminiApiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
     },
-  },
-});
+  });
+}
 
 // Helper to parse PDF documents cleanly
 const parsePdf = async (buffer: Buffer): Promise<string> => {
-  let parser: PDFParse | null = null;
   try {
-    parser = new PDFParse({ data: buffer });
-    const textResult = await parser.getText();
-    return textResult.text || '';
+    const data: any = await (pdfParse as any)(buffer);
+    return (data && data.text) ? String(data.text) : '';
   } catch (error: any) {
     console.error('Error parsing PDF:', error);
     throw new Error(`Failed to parse PDF document: ${error.message || error}`);
-  } finally {
-    if (parser) {
-      try {
-        await parser.destroy();
-      } catch (destroyErr) {
-        console.error('Error destroying PDFParse instance:', destroyErr);
-      }
-    }
   }
 };
 
@@ -66,7 +70,7 @@ const parseDocx = async (buffer: Buffer): Promise<string> => {
   }
 };
 
-// Robust helper to query Gemini models with exponential backoff and model fallbacks (handles transient 503/UNAVAILABLE errors)
+// Robust helper to query Gemini models with exponential backoff and model fallbacks
 const callGeminiWithRetry = async (
   prompt: string,
   config: any,
@@ -74,6 +78,7 @@ const callGeminiWithRetry = async (
   retries: number = 3,
   delayMs: number = 2000
 ): Promise<any> => {
+  if (!ai) throw new Error('Gemini client not initialized');
   const modelsToTry = [initialModel, 'gemini-2.5-flash', 'gemini-1.5-flash'];
   let lastError: any = null;
 
@@ -89,14 +94,11 @@ const callGeminiWithRetry = async (
       return response;
     } catch (err: any) {
       lastError = err;
-      console.warn(`Attempt ${attempt + 1} with ${model} failed:`, err.message || err);
-      
-      const isTransient = !err.status || err.status === 503 || err.status === 429 || err.status === 500 || err.message?.includes('demand') || err.message?.includes('limit');
-      
+      console.warn(`Attempt ${attempt + 1} with ${model} failed:`, err?.message || err);
+      const isTransient = !err.status || err.status === 503 || err.status === 429 || err.status === 500 || err?.message?.includes('demand') || err?.message?.includes('limit');
       if (!isTransient && attempt === 0) {
         console.log('Non-transient error, attempting model fallback anyway...');
       }
-
       if (attempt < retries - 1) {
         const sleepTime = delayMs * Math.pow(2, attempt);
         console.log(`Waiting ${sleepTime}ms before next retry...`);
@@ -105,6 +107,80 @@ const callGeminiWithRetry = async (
     }
   }
   throw lastError;
+};
+
+// Robust OpenAI fallback implementation
+const callOpenAIWithRetry = async (
+  prompt: string,
+  config: any,
+  initialModel: string = 'gpt-oss-20b',
+  retries: number = 3,
+  delayMs: number = 2000
+): Promise<any> => {
+  let lastError: any = null;
+  const modelsToTry = [initialModel, 'gpt-4o-mini', 'gpt-3.5-turbo'];
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const model = modelsToTry[attempt % modelsToTry.length];
+    const effectiveModel = normalizeModelName(model);
+    try {
+      console.log(`Sending prompt to OpenAI model ${effectiveModel} (Attempt ${attempt + 1}/${retries})...`);
+      const body = {
+        model: effectiveModel,
+        messages: [
+          { role: 'system', content: (config?.systemInstruction || 'You are a helpful assistant.') + ' Respond with valid JSON only and do not include markdown fences, commentary, or extra prose.' },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 2000,
+        temperature: 0.2,
+        response_format: { type: 'json_object' }
+      };
+
+      const resp = await fetch(openaiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + openaiApiKey
+        },
+        body: JSON.stringify(body)
+      });
+
+      const respJson = await resp.json();
+      // Extract the assistant's message content if present (OpenAI chat completions shape)
+      let extracted: any = null;
+      try {
+        if (Array.isArray(respJson.choices) && respJson.choices.length > 0) {
+          const ch = respJson.choices[0];
+          extracted = ch?.message?.content ?? ch?.text ?? null;
+        }
+      } catch (e) {
+        extracted = null;
+      }
+
+      const text = typeof extracted === 'string' ? extracted : JSON.stringify(respJson);
+      return { text, raw: respJson };
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`OpenAI attempt ${attempt + 1} failed:`, err?.message || err);
+      if (attempt < retries - 1) {
+        const sleepTime = delayMs * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, sleepTime));
+      }
+    }
+  }
+  throw lastError;
+};
+
+// Wrapper that selects which model client to call based on environment
+const callModelWithRetry = async (
+  prompt: string,
+  config: any,
+  preferredModel: string = 'gemini-3.5-flash'
+): Promise<any> => {
+  if (process.env.OPENAI_API_KEY) {
+    return callOpenAIWithRetry(prompt, config, process.env.OPENAI_MODEL || 'gpt-oss-20b');
+  }
+  return callGeminiWithRetry(prompt, config, preferredModel);
 };
 
 // Mock library of popular books for instant analysis/demos
@@ -252,12 +328,122 @@ const parseStructuredResponse = (text: string): any => {
   throw new Error(`Failed to parse structured response as JSON. Raw output: ${trimmed.substring(0, 150)}...`);
 };
 
+const normalizeAnalysisResponse = (parsedData: any): any => {
+  if (!parsedData || typeof parsedData !== 'object') {
+    return parsedData;
+  }
+
+  const title = typeof parsedData.title === 'string' ? parsedData.title : '';
+  const author = typeof parsedData.author === 'string' ? parsedData.author : '';
+  const category = typeof parsedData.category === 'string' ? parsedData.category : 'general';
+  const summary = typeof parsedData.summary === 'string' ? parsedData.summary : '';
+
+  const normalizeInsight = (value: any) => {
+    if (!value) return { insight: '', description: '', actionableTakeaway: '' };
+    if (typeof value === 'string') {
+      return { insight: value, description: '', actionableTakeaway: '' };
+    }
+    if (typeof value === 'object') {
+      return {
+        insight: typeof value.insight === 'string' ? value.insight : '',
+        description: typeof value.description === 'string' ? value.description : '',
+        actionableTakeaway: typeof value.actionableTakeaway === 'string' ? value.actionableTakeaway : ''
+      };
+    }
+    return { insight: String(value), description: '', actionableTakeaway: '' };
+  };
+
+  const normalizeInsights = (value: any) => {
+    if (Array.isArray(value)) {
+      return value.map(normalizeInsight).filter((item) => item.insight || item.description || item.actionableTakeaway);
+    }
+    if (typeof value === 'string') {
+      return [normalizeInsight(value)];
+    }
+    return [];
+  };
+
+  const normalizePracticalApplication = (value: any) => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return {
+        habits: Array.isArray(value.habits) ? value.habits.filter((item: any) => typeof item === 'string') : [],
+        rituals: Array.isArray(value.rituals) ? value.rituals.filter((item: any) => typeof item === 'string') : [],
+        systems: Array.isArray(value.systems) ? value.systems.filter((item: any) => typeof item === 'string') : [],
+        principles: Array.isArray(value.principles) ? value.principles.filter((item: any) => typeof item === 'string') : []
+      };
+    }
+
+    if (Array.isArray(value)) {
+      return {
+        habits: value.filter((item: any) => typeof item === 'string'),
+        rituals: [],
+        systems: [],
+        principles: []
+      };
+    }
+
+    if (typeof value === 'string') {
+      return {
+        habits: [],
+        rituals: [],
+        systems: [],
+        principles: [value]
+      };
+    }
+
+    return {
+      habits: [],
+      rituals: [],
+      systems: [],
+      principles: []
+    };
+  };
+
+  const normalizeTop5Evaluation = (value: any) => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return {
+        isTop5: typeof value.isTop5 === 'boolean' ? value.isTop5 : false,
+        rankingJustification: typeof value.rankingJustification === 'string' ? value.rankingJustification : ''
+      };
+    }
+
+    if (typeof value === 'string') {
+      return {
+        isTop5: /top\s*5/i.test(value),
+        rankingJustification: value
+      };
+    }
+
+    if (typeof value === 'boolean') {
+      return {
+        isTop5: value,
+        rankingJustification: ''
+      };
+    }
+
+    return {
+      isTop5: false,
+      rankingJustification: ''
+    };
+  };
+
+  return {
+    title,
+    author,
+    category,
+    summary,
+    timelessInsights: normalizeInsights(parsedData.timelessInsights),
+    practicalApplication: normalizePracticalApplication(parsedData.practicalApplication),
+    top5Evaluation: normalizeTop5Evaluation(parsedData.top5Evaluation)
+  };
+};
+
 // Main Analysis API Route
 app.post('/api/analyze-book', upload.single('file'), async (req, res) => {
   try {
-    if (!apiKey) {
+    if (!geminiApiKey && !openaiApiKey) {
       return res.status(500).json({
-        error: 'Gemini API key is not configured on the server. Please add GEMINI_API_KEY in Secrets.'
+        error: 'No AI API key configured on the server. Please add GEMINI_API_KEY or OPENAI_API_KEY in Secrets.'
       });
     }
 
@@ -308,9 +494,6 @@ app.post('/api/analyze-book', upload.single('file'), async (req, res) => {
       wasTruncated = true;
     }
 
-    // Call Gemini using structured output schema to meet strict user requests
-    const model = 'gemini-3.5-flash';
-
     const prompt = `
       You are an expert, world-class book analyst and avid reader. 
       Analyze the following text extracted from a book (or book excerpt) titled "${fileName}".
@@ -318,7 +501,7 @@ app.post('/api/analyze-book', upload.single('file'), async (req, res) => {
       ${isSample ? "Note: This is a descriptive excerpt of a famous book. Please expand your deep expertise on this entire famous book to provide highly comprehensive results." : ""}
 
       Please fulfill these requirements:
-      1. Categorize the book into one of the specified categories: "problem-solving", "decision making", "time management", or determine an appropriate highly-relevant alternative category if it does not fit those three.
+      1. Categorize the book into one of the specified categories: \"problem-solving\", \"decision making\", \"time management\", or determine an appropriate highly-relevant alternative category if it does not fit those three.
       2. Provide a beautiful, highly focused, and structured summary in markdown format of the book's core thesis, arguments, and content.
       3. Extract 5 to 7 powerful, timeless, and actionable insights that help build work and life skills.
       4. Advise on practical applications: how to realistically translate these insights into daily habits, rituals, systems, and principles.
@@ -326,13 +509,15 @@ app.post('/api/analyze-book', upload.single('file'), async (req, res) => {
 
       CRITICAL FOR PERFORMANCE: Keep all text generated concise, direct, and tightly written. Avoid verbose fluff, repetitive definitions, or unnecessary conversational filler to optimize speed and latency.
 
+      IMPORTANT: Return your entire answer as a single valid JSON object with the keys title, author, category, summary, timelessInsights, practicalApplication, and top5Evaluation. Do not wrap the JSON in markdown code fences or add any extra commentary.
+
       Here is the book's content:
       --- START BOOK CONTENT ---
       ${textContent}
       --- END BOOK CONTENT ---
     `;
 
-    const response = await callGeminiWithRetry(prompt, {
+    const modelResponse = await callModelWithRetry(prompt, {
       systemInstruction: "You are an analytical, deeply thoughtful book mentor. You extract deep wisdom and practical principles, avoiding generic business buzzwords. Be direct and concise.",
       responseMimeType: 'application/json',
       responseSchema: {
@@ -383,17 +568,100 @@ app.post('/api/analyze-book', upload.single('file'), async (req, res) => {
         },
         required: ["title", "author", "category", "summary", "timelessInsights", "practicalApplication", "top5Evaluation"]
       }
-    }, model);
+    });
 
-    const responseText = response.text;
-    if (!responseText) {
+    // Normalize the model response into a string or structured object and parse safely
+    let parsedData: any = null;
+
+    const tryParseText = (txt: string) => {
+      if (!txt || typeof txt !== 'string') return null;
+      try {
+        return parseStructuredResponse(txt);
+      } catch (e) {
+        // parsing failed; return null to allow fallback attempts
+        return null;
+      }
+    };
+
+    if (!modelResponse) {
       throw new Error('Received empty response from the analysis model.');
     }
 
-    const parsedData = parseStructuredResponse(responseText);
-    
+    if (typeof modelResponse === 'string') {
+      parsedData = tryParseText(modelResponse);
+    } else if (typeof modelResponse === 'object') {
+      // Common shapes: { text: '...', ... } or { output: [...] } or already a structured object
+      if (typeof (modelResponse as any).text === 'string') {
+        parsedData = tryParseText((modelResponse as any).text);
+      }
+
+      if (!parsedData && typeof (modelResponse as any).output === 'string') {
+        parsedData = tryParseText((modelResponse as any).output as string);
+      }
+
+      if (!parsedData && Array.isArray((modelResponse as any).output) && (modelResponse as any).output.length > 0) {
+        try {
+          const out = (modelResponse as any).output[0];
+          let candidate = '';
+          if (typeof out === 'string') candidate = out;
+          else if (out?.content) {
+            if (typeof out.content === 'string') candidate = out.content;
+            else if (Array.isArray(out.content)) candidate = out.content.map((c: any) => (typeof c === 'string' ? c : (c?.text || ''))).join('\n');
+          } else if (out?.text) candidate = out.text;
+          if (candidate) parsedData = tryParseText(candidate);
+        } catch (e) {
+          // ignore and continue
+        }
+      }
+
+      if (!parsedData && (modelResponse as any).title && ((modelResponse as any).author || (modelResponse as any).category)) {
+        parsedData = modelResponse;
+      }
+
+      if (!parsedData) {
+        const stringified = JSON.stringify(modelResponse);
+        parsedData = tryParseText(stringified);
+      }
+    }
+
+    if (!parsedData) {
+      throw new Error('Failed to parse structured response from the analysis model.');
+    }
+
+    let normalizedData = normalizeAnalysisResponse(parsedData);
+    const hasUsefulContent = Boolean(
+      normalizedData?.summary ||
+      normalizedData?.title ||
+      normalizedData?.author ||
+      normalizedData?.timelessInsights?.length ||
+      normalizedData?.practicalApplication?.habits?.length ||
+      normalizedData?.practicalApplication?.rituals?.length ||
+      normalizedData?.practicalApplication?.systems?.length ||
+      normalizedData?.practicalApplication?.principles?.length
+    );
+
+    if (!hasUsefulContent) {
+      normalizedData = {
+        title: fileName.replace(/\.[^.]+$/, '') || 'Untitled Analysis',
+        author: 'Unknown',
+        category: 'general',
+        summary: textContent.substring(0, 1200),
+        timelessInsights: [],
+        practicalApplication: {
+          habits: [],
+          rituals: [],
+          systems: [],
+          principles: []
+        },
+        top5Evaluation: {
+          isTop5: false,
+          rankingJustification: 'The model did not return a structured evaluation for this upload, so a fallback summary was returned.'
+        }
+      };
+    }
+
     return res.json({
-      ...parsedData,
+      ...normalizedData,
       wasTruncated,
       fileAnalyzed: fileName,
       charCount: textContent.length
@@ -437,3 +705,4 @@ async function startServer() {
 }
 
 startServer();
+

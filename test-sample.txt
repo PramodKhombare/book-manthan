@@ -1,0 +1,7 @@
+This is a small test 'book' file.
+
+Chapter 1: Introduction
+The habit of testing code helps catch bugs early.
+
+Chapter 2: Conclusion
+Testing is essential.
